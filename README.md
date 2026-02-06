@@ -117,16 +117,60 @@ If you want to query Mail.app or iMessage:
 
 ### 5. Slack setup (optional)
 
-To read from Slack, you need a bot token:
+To read from Slack, you need to create a Slack app and install it to your workspace.
 
-1. Create a Slack app at [api.slack.com/apps](https://api.slack.com/apps)
-2. Add OAuth scopes: `channels:history`, `channels:read`, `groups:history`, `groups:read`, `users:read`
-3. Install to your workspace and copy the Bot User OAuth Token (`xoxb-...`)
-4. Store it:
+**Step 1: Create the app**
+
+1. Go to [api.slack.com/apps](https://api.slack.com/apps) and click **Create New App**
+2. Choose **From scratch**
+3. Name it something like "Alteris Listener" and select your workspace
+
+**Step 2: Add permissions**
+
+1. In the left sidebar, go to **OAuth & Permissions**
+2. Scroll to **Scopes → Bot Token Scopes** and add these:
+
+| Scope | Why |
+|-------|-----|
+| `channels:history` | Read messages in public channels |
+| `channels:read` | List public channels |
+| `groups:history` | Read messages in private channels the bot is in |
+| `groups:read` | List private channels the bot is in |
+| `users:read` | Resolve user IDs to display names |
+
+**Step 3: Install to workspace**
+
+1. Scroll back up to **OAuth Tokens** and click **Install to Workspace**
+2. Review the permissions and click **Allow**
+3. Copy the **Bot User OAuth Token** (starts with `xoxb-`)
+
+**Step 4: Store the token**
 
 ```bash
 alteris-listener set-key slack
+# Paste the xoxb-... token when prompted
 ```
+
+Or set it as an environment variable:
+
+```bash
+export SLACK_BOT_TOKEN=xoxb-your-token-here
+```
+
+**Step 5: Invite the bot to channels**
+
+The bot can only read channels it's a member of. In each Slack channel you want to query:
+
+1. Type `/invite @Alteris Listener` (or whatever you named it)
+2. Or click the channel name → **Integrations** → **Add apps**
+
+**Step 6: Verify it works**
+
+```bash
+alteris-listener run-query todo_extractor -s slack --hours 24
+```
+
+If no channels are found, make sure the bot has been invited to at least one channel.
 
 ### 6. Granola setup (optional)
 
