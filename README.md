@@ -62,19 +62,27 @@ Keys are stored securely in macOS Keychain. You can also set them via environmen
 
 ### 2. Set up your queries directory
 
-Queries are markdown files with YAML frontmatter that define the prompts sent to the LLM. You need to tell the CLI where to find them.
+Queries are markdown files with YAML frontmatter that define the prompts sent to the LLM. Clone the queries repo:
+
+```bash
+git clone https://github.com/AlterisAi/queries.git
+```
+
+Then tell the CLI where to find them. Pick one:
 
 **Option A: Environment variable (recommended)**
 
 ```bash
 # Add to your ~/.zshrc or ~/.bashrc
-export ALTERIS_QUERIES_DIR=/path/to/your/queries
+export ALTERIS_QUERIES_DIR=/path/to/queries/queries
 ```
+
+Note the double `queries/queries` — the repo is called `queries` and the markdown files live in a `queries/` subdirectory inside it.
 
 **Option B: CLI flag**
 
 ```bash
-alteris-listener run-query my_query -s mail --queries-dir /path/to/your/queries
+alteris-listener run-query my_query -s mail --queries-dir /path/to/queries/queries
 ```
 
 **Option C: Default**
