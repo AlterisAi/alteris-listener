@@ -7,20 +7,26 @@ Results can optionally be uploaded to the Alteris backend for use in the [Alteri
 ## Requirements
 
 - **macOS** (reads from macOS-native databases and Keychain)
-- **Python 3.11+**
+- **Python 3.11+** (3.13 recommended)
 - **Full Disk Access** for your terminal app (required to read Mail.app and iMessage databases)
   - System Settings → Privacy & Security → Full Disk Access → add your terminal (Terminal.app, iTerm2, etc.)
 
 ## Installation
 
 ```bash
+# Install Python 3.13 if you don't have it
+brew install python@3.13
+
 # Clone the repo
 git clone https://github.com/AlterisAi/alteris-listener.git
 cd alteris-listener
 
 # Create a virtual environment
-python3 -m venv .venv
+python3.13 -m venv .venv
 source .venv/bin/activate
+
+# Upgrade pip first
+pip install --upgrade pip
 
 # Install with all LLM providers
 pip install -e ".[all]"

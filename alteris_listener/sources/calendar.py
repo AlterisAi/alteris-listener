@@ -26,8 +26,32 @@ def read_upcoming_events(days_ahead: int = 7, days_behind: int = 1) -> List[Mess
     store = EventKit.EKEventStore.alloc().init()
 
     status = EventKit.EKEventStore.authorizationStatusForEntityType_(EventKit.EKEntityTypeEvent)
-    if status not in (3, 4):
-        logger.warning("Calendar access not granted (status=%s)", status)
+
+    # Status 0 = not determined — request access to trigger the macOS permission prompt
+    if status == 0:
+        import threading
+        granted_event = threading.Event()
+        grant_result = [False]
+
+        def callback(granted, error):
+            grant_result[0] = granted
+            granted_event.set()
+
+        store.requestFullAccessToEventsWithCompletion_(callback)
+        granted_event.wait(timeout=30)
+
+        if not grant_result[0]:
+            logger.warning(
+                "Calendar access denied. Grant access in: "
+                "System Settings → Privacy & Security → Calendars"
+            )
+            return []
+    elif status not in (3, 4):
+        logger.warning(
+            "Calendar access not granted (status=%s). Grant access in: "
+            "System Settings → Privacy & Security → Calendars",
+            status,
+        )
         return []
 
     cal = NSCalendar.currentCalendar()
