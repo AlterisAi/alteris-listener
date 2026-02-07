@@ -244,6 +244,7 @@ def _run_queries(
     raw: bool,
     multi: bool,
     user_context: str = "",
+    json_mode: bool = False,
 ) -> Tuple[Dict[str, Any], Dict[str, str]]:
     """Run all query definitions against context, accumulate results."""
     query_results: Dict[str, Any] = {}
@@ -262,7 +263,9 @@ def _run_queries(
             query_results[qname] = result
             query_versions[qname] = datetime.now(timezone.utc).isoformat()
 
-        if raw:
+        if json_mode:
+            pass  # Don't print per-item; collected and printed at end
+        elif raw:
             click.echo(json.dumps(result, indent=2, ensure_ascii=False))
         else:
             _display_result(result, indent="    " if multi else "  ")
@@ -339,7 +342,9 @@ def _print_summary(item_count: int, query_count: int, uploaded: bool) -> None:
 @click.option("--max", "limit", default=10, help="Max items to process")
 @click.option("--thread-id", default=None, help="Process a specific email thread (mail only)")
 @click.option("--user-email", default=None, help="Your email address")
-@click.option("--raw", is_flag=True, help="Print raw JSON")
+@click.option("--raw", is_flag=True, help="Print raw JSON per item (verbose)")
+@click.option("--json", "json_mode", is_flag=True,
+              help="Output only clean JSON to stdout. All progress goes to stderr.")
 @click.option("--upload", is_flag=True, help="Upload enriched results to Alteris")
 @click.option("--context", "-c", "context_names", multiple=True, default=None,
               help="Context docs to load from cloud (default: clarity_queue). "
@@ -357,6 +362,7 @@ def run_query(
     thread_id: Optional[str],
     user_email: Optional[str],
     raw: bool,
+    json_mode: bool,
     upload: bool,
     context_names: tuple,
     no_context: bool,
@@ -372,7 +378,17 @@ def run_query(
         alteris-listener run-query meeting_summary meeting_todo_extractor -s granola --hours 168
         alteris-listener run-query todo_extractor_thread -s mail --hours 48 --upload
         alteris-listener run-query meeting_summary -s granola --max 5 -c clarity_queue
+        alteris-listener run-query todo_extractor -s mail --json | jq .
     """
+    global console
+
+    # In JSON mode, redirect all Rich output to stderr so stdout is clean JSON
+    if json_mode:
+        console = Console(stderr=True)
+        raw = True  # json mode implies raw (we need the parsed dicts)
+
+    # Collector for --json mode
+    json_results: List[Dict[str, Any]] = []
     # ── Load query definitions ────────────────────────────────────
     qdir = _resolve_queries_dir(queries_dir)
     all_queries = load_queries_from_dir(qdir)
@@ -448,7 +464,17 @@ def run_query(
             query_results, query_versions = _run_queries(
                 llm, query_defs, context, raw, multi,
                 user_context=user_context_text,
+                json_mode=json_mode,
             )
+
+            if json_mode and query_results:
+                json_results.append({
+                    "source": source,
+                    "item_id": tid,
+                    "subject": subject,
+                    "timestamp": thread_msgs[0].timestamp.isoformat(),
+                    "query_results": query_results,
+                })
 
             if upload and query_results:
                 _upload_enriched(
@@ -461,6 +487,8 @@ def run_query(
             console.print()
 
         _print_summary(len(threads), len(query_defs), upload)
+        if json_mode:
+            click.echo(json.dumps(json_results, indent=2, ensure_ascii=False))
         return
 
     # ── Handle individual items (all other sources) ───────────────
@@ -488,7 +516,17 @@ def run_query(
         query_results, query_versions = _run_queries(
             llm, query_defs, context, raw, multi,
             user_context=user_context_text,
+            json_mode=json_mode,
         )
+
+        if json_mode and query_results:
+            json_results.append({
+                "source": source,
+                "item_id": item_id,
+                "subject": msg.subject or "",
+                "timestamp": msg.timestamp.isoformat(),
+                "query_results": query_results,
+            })
 
         if upload and query_results:
             _upload_enriched(
@@ -501,3 +539,5 @@ def run_query(
         console.print()
 
     _print_summary(len(items), len(query_defs), upload)
+    if json_mode:
+        click.echo(json.dumps(json_results, indent=2, ensure_ascii=False))
