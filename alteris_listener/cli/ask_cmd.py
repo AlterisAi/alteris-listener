@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 import click
 from rich.console import Console
 from rich.panel import Panel
 
+from alteris_listener.api.context import fetch_user_context
 from alteris_listener.llm.client import LLMClient
 from alteris_listener.sources.calendar import read_upcoming_events
 from alteris_listener.sources.granola import check_granola_available, read_recent_meetings
@@ -26,7 +28,11 @@ ALL_SOURCES = ["mail", "imessage", "calendar", "slack", "granola"]
 @click.option("--model", default=None)
 @click.option("--hours", default=24, help="Hours of history to include")
 @click.option("--source", type=click.Choice(ALL_SOURCES + ["all"]), default="all")
-def ask(question: str, provider: str, model: Optional[str], hours: int, source: str):
+@click.option("--context", "-c", "context_names", multiple=True, default=None,
+              help="Context docs to load from cloud (e.g. -c clarity_queue -c goals_and_values)")
+@click.option("--no-context", is_flag=True, help="Skip fetching user context from cloud")
+def ask(question: str, provider: str, model: Optional[str], hours: int, source: str,
+        context_names: tuple, no_context: bool):
     """Ask a natural language question about your messages.
 
     \b
@@ -35,12 +41,29 @@ def ask(question: str, provider: str, model: Optional[str], hours: int, source: 
         alteris-listener ask "Summarize my unread emails from today"
         alteris-listener ask "What happened in Slack today?" --source slack
         alteris-listener ask "What was discussed in my last meeting?" --source granola
+        alteris-listener ask "What should I prioritize?" -c clarity_queue -c goals_and_values
     """
     llm = LLMClient(provider=provider, model=model, thinking_level="low")
     console.print(f"[dim]Using {llm.provider} / {llm.model}[/dim]")
     console.print()
 
+    now = datetime.now(timezone.utc)
+    local_now = datetime.now()
+
     context_parts = []
+
+    # Fetch cloud context if available
+    user_context_text = ""
+    if not no_context:
+        doc_names = list(context_names) if context_names else ["clarity_queue"]
+        try:
+            user_context = fetch_user_context(doc_names)
+            if user_context:
+                user_context_text = "\n\n".join(
+                    f"## {name}\n{content}" for name, content in user_context.items()
+                )
+        except Exception:
+            pass  # Cloud context is optional
 
     if source in ("mail", "all"):
         emails = read_recent_emails(hours=hours, limit=30)
@@ -112,14 +135,26 @@ def ask(question: str, provider: str, model: Optional[str], hours: int, source: 
 
     context = "".join(context_parts)
 
+    time_info = (
+        f"Current date and time: {local_now.strftime('%A, %B %d, %Y at %I:%M %p')} "
+        f"(UTC: {now.strftime('%Y-%m-%d %H:%M')})"
+    )
+
     system_prompt = (
         "You are Alteris, a helpful AI assistant with access to the user's emails, "
         "messages, calendar, Slack messages, and meeting transcripts. Answer the user's "
         "question based on the context provided. Be concise and specific. "
-        "If the answer isn't in the provided data, say so."
+        "If the answer isn't in the provided data, say so.\n\n"
+        f"{time_info}"
     )
 
-    user_message = f"## Context\n\n{context}\n\n## Question\n\n{question}"
+    user_parts = []
+    if user_context_text:
+        user_parts.append(f"## User Profile & Goals\n\n{user_context_text}")
+    user_parts.append(f"## Data Context\n\n{context}")
+    user_parts.append(f"## Question\n\n{question}")
+
+    user_message = "\n\n".join(user_parts)
 
     with console.status("[bold green]Thinking..."):
         response = llm.run(system_prompt, user_message)
