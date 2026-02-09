@@ -83,6 +83,68 @@ def read_upcoming_events(days_ahead: int = 7, days_behind: int = 1) -> List[Mess
         cal_name = str(event.calendar().title()) if event.calendar() else ""
         is_all_day = bool(event.isAllDay())
 
+        # Extract organizer
+        organizer_name = ""
+        organizer_email = ""
+        if event.organizer():
+            org = event.organizer()
+            organizer_name = str(org.name() or "")
+            try:
+                organizer_email = str(org.emailAddress() or "")
+            except AttributeError:
+                pass
+
+        # Extract attendees with RSVP status
+        attendee_list = []
+        ek_attendees = event.attendees()
+        if ek_attendees and len(ek_attendees) > 0:
+            status_map = {
+                0: "pending", 1: "accepted", 2: "declined",
+                3: "tentative", 4: "delegated", 5: "completed",
+                6: "in-process",
+            }
+            role_map = {
+                0: "unknown", 1: "required", 2: "optional",
+                3: "chair", 4: "non-participant",
+            }
+            for att in ek_attendees:
+                att_name = str(att.name() or "")
+                att_status = status_map.get(att.participantStatus(), "unknown")
+                att_role = role_map.get(att.participantRole(), "unknown")
+                # Extract email from URL (mailto:...)
+                att_email = ""
+                att_url = att.URL()
+                if att_url:
+                    url_str = str(att_url)
+                    if "mailto:" in url_str:
+                        att_email = url_str.split("mailto:")[-1]
+                attendee_list.append({
+                    "name": att_name,
+                    "email": att_email,
+                    "status": att_status,
+                    "role": att_role,
+                })
+
+        # Extract URL
+        event_url = ""
+        if event.URL():
+            event_url = str(event.URL())
+
+        # Recurrence info
+        is_recurring = bool(event.hasRecurrenceRules())
+        recurrence_desc = ""
+        if is_recurring and event.recurrenceRules():
+            freq_map = {0: "daily", 1: "weekly", 2: "monthly", 3: "yearly"}
+            for rule in event.recurrenceRules():
+                freq = freq_map.get(rule.frequency(), "unknown")
+                interval = rule.interval()
+                recurrence_desc = f"{freq}" if interval == 1 else f"every {interval} {freq}"
+
+        # Event status
+        ev_status_map = {0: "none", 1: "confirmed", 2: "tentative", 3: "cancelled"}
+        event_status = ev_status_map.get(event.status(), "unknown")
+
+        # Build rich body text
         body_parts = [title]
         if location:
             body_parts.append(f"Location: {location}")
@@ -90,12 +152,27 @@ def read_upcoming_events(days_ahead: int = 7, days_behind: int = 1) -> List[Mess
             body_parts.append("All day event")
         else:
             body_parts.append(f"{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}")
+        if organizer_name:
+            body_parts.append(f"Organizer: {organizer_name}" +
+                              (f" ({organizer_email})" if organizer_email else ""))
+        if attendee_list:
+            att_strs = []
+            for a in attendee_list:
+                s = a["name"] or a["email"] or "unknown"
+                if a["status"] not in ("pending", "unknown"):
+                    s += f" [{a['status']}]"
+                att_strs.append(s)
+            body_parts.append(f"Attendees: {', '.join(att_strs)}")
+        if recurrence_desc:
+            body_parts.append(f"Recurrence: {recurrence_desc}")
+        if event_url:
+            body_parts.append(f"URL: {event_url}")
         if notes:
-            body_parts.append(notes[:500])
+            body_parts.append(notes[:1000])
 
         messages.append(Message(
             source="calendar",
-            sender=cal_name,
+            sender=organizer_email or cal_name,
             recipient="me",
             subject=title,
             body="\n".join(body_parts),
@@ -105,7 +182,81 @@ def read_upcoming_events(days_ahead: int = 7, days_behind: int = 1) -> List[Mess
                 "is_all_day": is_all_day,
                 "end": end_dt.isoformat(),
                 "location": location,
+                "organizer_name": organizer_name,
+                "organizer_email": organizer_email,
+                "attendees": attendee_list,
+                "event_url": event_url,
+                "is_recurring": is_recurring,
+                "recurrence": recurrence_desc,
+                "status": event_status,
             },
         ))
 
-    return messages
+    # Deduplicate by (title, start_time) — same event synced across calendars
+    seen: set[tuple[str, float]] = set()
+    deduped: list[Message] = []
+    for msg in messages:
+        key = (msg.subject.strip().lower(), msg.timestamp.timestamp())
+        if key not in seen:
+            seen.add(key)
+            deduped.append(msg)
+
+    # Collapse recurring events: keep only the next upcoming and most recent past
+    # occurrence for each recurring event title
+    import time as _time
+    now_ts = _time.time()
+    recurring_groups: dict[str, list[Message]] = {}
+    non_recurring: list[Message] = []
+
+    for msg in deduped:
+        meta = msg.metadata or {}
+        if meta.get("is_recurring"):
+            title_key = msg.subject.strip().lower()
+            recurring_groups.setdefault(title_key, []).append(msg)
+        else:
+            non_recurring.append(msg)
+
+    collapsed: list[Message] = list(non_recurring)
+    for title_key, occurrences in recurring_groups.items():
+        past = [m for m in occurrences if m.timestamp.timestamp() <= now_ts]
+        future = [m for m in occurrences if m.timestamp.timestamp() > now_ts]
+        # Keep most recent past occurrence
+        if past:
+            past.sort(key=lambda m: m.timestamp.timestamp(), reverse=True)
+            collapsed.append(past[0])
+        # Keep next upcoming occurrence
+        if future:
+            future.sort(key=lambda m: m.timestamp.timestamp())
+            collapsed.append(future[0])
+
+    logger.info(
+        "Calendar: %d raw, %d after cross-cal dedup, %d after recurring collapse",
+        len(messages), len(deduped), len(collapsed),
+    )
+
+    # Extract shared calendar signal — calendars named "X and Y" where
+    # one name matches the user indicate family/partner relationship.
+    # Store as metadata on the messages for downstream tier computation.
+    shared_calendars: dict[str, str] = {}
+    user_first_names = {"aniruddha", "ani"}  # TODO: make configurable
+    for msg in collapsed:
+        cal = (msg.metadata or {}).get("calendar", "")
+        if " and " in cal.lower():
+            parts = [p.strip().lower() for p in cal.lower().split(" and ")]
+            for part in parts:
+                if part in user_first_names:
+                    other = [p for p in parts if p != part]
+                    if other:
+                        shared_calendars[cal] = other[0].title()
+    if shared_calendars:
+        for msg in collapsed:
+            cal = (msg.metadata or {}).get("calendar", "")
+            if cal in shared_calendars:
+                msg.metadata["shared_calendar_with"] = shared_calendars[cal]
+                msg.metadata["family_signal"] = True
+        logger.info(
+            "Shared calendars detected: %s",
+            ", ".join(f"{k} → {v}" for k, v in shared_calendars.items()),
+        )
+
+    return collapsed

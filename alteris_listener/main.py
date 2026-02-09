@@ -7,6 +7,7 @@ from rich.console import Console
 
 from alteris_listener.cli.ask_cmd import ask
 from alteris_listener.cli.auth_cmd import login, logout, whoami
+from alteris_listener.cli.graph_cmd import graph_cli
 from alteris_listener.cli.query_cmd import run_query
 
 console = Console()
@@ -51,6 +52,7 @@ cli.add_command(ask)
 cli.add_command(login)
 cli.add_command(logout)
 cli.add_command(whoami)
+cli.add_command(graph_cli)
 
 
 if __name__ == "__main__":
