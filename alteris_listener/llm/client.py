@@ -104,10 +104,23 @@ class LLMClient:
         }
         budget = thinking_budgets.get(self.thinking_level, 1024)
 
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            thinking_config=types.ThinkingConfig(thinking_budget=budget),
+        # Only include thinking_config for models that support it
+        # gemini-2.5-* and gemini-3-* support thinking; 2.0 does not
+        model_supports_thinking = any(
+            self.model.startswith(p) for p in ("gemini-2.5", "gemini-3")
         )
+
+        if model_supports_thinking and self.thinking_level != "off":
+            config = types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                thinking_config=types.ThinkingConfig(thinking_budget=budget),
+                max_output_tokens=16384,
+            )
+        else:
+            config = types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                max_output_tokens=16384,
+            )
 
         response = self._gemini_client.models.generate_content(
             model=self.model,
@@ -127,7 +140,7 @@ class LLMClient:
     def _run_claude(self, system_prompt: str, user_message: str) -> str:
         response = self._claude_client.messages.create(
             model=self.model,
-            max_tokens=2048,
+            max_tokens=16384,
             system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
@@ -145,6 +158,7 @@ class LLMClient:
 
         try:
             return json.loads(cleaned)
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse LLM response as JSON, returning raw text")
+        except json.JSONDecodeError as e:
+            logger.warning("Failed to parse LLM response as JSON: %s", e)
+            logger.warning("Raw LLM response:\n%s", raw)
             return {"raw_text": raw}

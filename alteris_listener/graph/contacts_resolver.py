@@ -142,15 +142,17 @@ def _read_contacts_from_db(path: Path) -> list[ContactRecord]:
 
 
 class ContactLookup:
-    """Fast lookup table: phone/email → display name.
+    """Fast lookup table: phone/email → display name and cross-references.
 
     Build once from Contacts.app database, then use to resolve
-    iMessage phone numbers and email-only contacts to display names.
+    iMessage phone numbers and email-only contacts to display names,
+    and to find email addresses for phone-number contacts.
     """
 
     def __init__(self):
         self._by_email: dict[str, str] = {}
         self._by_phone: dict[str, str] = {}
+        self._phone_to_emails: dict[str, list[str]] = {}
         self._loaded = False
 
     def load(self) -> int:
@@ -164,10 +166,18 @@ class ContactLookup:
                 normalized = _normalize_phone(phone)
                 self._by_phone[normalized] = c.name
 
+            # Cross-reference: phone → emails for contact merging
+            if c.phones and c.emails:
+                emails_lower = [e.lower().strip() for e in c.emails]
+                for phone in c.phones:
+                    normalized = _normalize_phone(phone)
+                    if normalized:
+                        self._phone_to_emails[normalized] = emails_lower
+
         self._loaded = True
         logger.info(
-            "Contact lookup: %d email mappings, %d phone mappings",
-            len(self._by_email), len(self._by_phone),
+            "Contact lookup: %d email mappings, %d phone mappings, %d phone→email bridges",
+            len(self._by_email), len(self._by_phone), len(self._phone_to_emails),
         )
         return len(contacts)
 
@@ -191,6 +201,27 @@ class ContactLookup:
             return self._by_phone[normalized]
 
         return None
+
+    def resolve_email(self, phone: str) -> str | None:
+        """Look up the primary email for a phone number.
+
+        Returns the first email associated with this phone in
+        macOS Contacts.app, or None if not found.
+        """
+        if not self._loaded:
+            self.load()
+
+        normalized = _normalize_phone(phone)
+        emails = self._phone_to_emails.get(normalized)
+        if emails:
+            return emails[0]
+        return None
+
+    def phone_email_bridges(self) -> dict[str, list[str]]:
+        """Return the full phone→emails mapping for bulk operations."""
+        if not self._loaded:
+            self.load()
+        return dict(self._phone_to_emails)
 
     @property
     def email_count(self) -> int:

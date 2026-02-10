@@ -30,6 +30,79 @@ logger = logging.getLogger(__name__)
 
 TRIAGE_MODEL = "qwen3:30b-a3b"
 
+
+class GeminiTriageClient:
+    """Drop-in replacement for OllamaClient that uses Gemini Flash API.
+
+    Same interface: is_available(), generate(). Much faster for bulk triage
+    since it runs on Google's infrastructure with high parallelism.
+    """
+
+    def __init__(self, model: str = "gemini-2.5-flash"):
+        self.model = model
+        self._api_key: str | None = None
+
+    def _get_key(self) -> str:
+        if self._api_key:
+            return self._api_key
+        import os
+        # Try env var first, then keyring
+        key = os.environ.get("GEMINI_API_KEY")
+        if not key:
+            try:
+                from alteris_listener.llm.client import _get_api_key
+                key = _get_api_key("GEMINI_API_KEY", "gemini")
+            except Exception:
+                pass
+        if not key:
+            raise ValueError("GEMINI_API_KEY not set")
+        self._api_key = key
+        return key
+
+    def is_available(self) -> bool:
+        try:
+            self._get_key()
+            return True
+        except Exception:
+            return False
+
+    def generate(
+        self,
+        prompt: str,
+        model: str = "",
+        system: str = "",
+        temperature: float = 0.1,
+        max_tokens: int = 2048,
+        format_json: bool = False,
+    ) -> str | None:
+        """Call Gemini API with same interface as OllamaClient.generate()."""
+        from google import genai
+        from google.genai import types
+
+        key = self._get_key()
+        client = genai.Client(api_key=key)
+
+        use_model = model if model and model.startswith("gemini") else self.model
+
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+            system_instruction=system if system else None,
+        )
+        if format_json:
+            config.response_mime_type = "application/json"
+
+        try:
+            response = client.models.generate_content(
+                model=use_model,
+                contents=prompt,
+                config=config,
+            )
+            return response.text
+        except Exception as exc:
+            logger.error("Gemini generate failed: %s", exc)
+            return None
+
 VALID_DOMAINS = {"work", "personal", "family", "financial", "health", "legal", "travel", "shopping", "automated"}
 VALID_PII = {"financial", "medical", "legal", "credentials", "travel_docs"}
 
@@ -425,35 +498,55 @@ def run_triage(
     parallel: int = 3,
     resume: bool = True,
     batch_size: int = 5,
+    provider: str = "ollama",
+    fix_failed: bool = False,
 ) -> dict:
     """Run Pass 3 LLM triage on all embedded nodes.
 
-    Classifies each node by score using qwen3:8b with concurrent requests.
+    Classifies each node by score using LLM with concurrent requests.
     Batches thread-related items together for context and throughput.
     Results stored in nodes table (triage_relevant as 0-10, triage_reason).
 
     Args:
         store: GraphStore instance.
-        model: Ollama model name for triage.
-        parallel: Number of concurrent Ollama requests.
+        model: Model name for triage.
+        parallel: Number of concurrent requests.
         resume: If True, skip nodes that already have triage results.
         batch_size: Max items per LLM call (1-20). Default 5.
+        provider: "ollama" (local) or "gemini" (API, faster).
+        fix_failed: If True, retry only PARSE_FAILED nodes.
 
     Returns dict with triage stats.
     """
-    client = OllamaClient()
-    if not client.is_available():
-        return {"error": "ollama_not_running"}
+    if provider == "gemini":
+        gemini_model = model if model.startswith("gemini") else "gemini-2.5-flash"
+        client = GeminiTriageClient(model=gemini_model)
+        if not client.is_available():
+            return {"error": "gemini_api_key_missing"}
+        model = gemini_model  # override for display
+    else:
+        client = OllamaClient()
+        if not client.is_available():
+            return {"error": "ollama_not_running"}
 
     now = int(time.time())
 
-    if resume:
+    if fix_failed:
         rows = store.conn.execute(
             """SELECT id, node_type, source, timestamp, subject, sender,
                       recipients, body_preview, heuristic_score, tier, thread_id
                FROM nodes
                WHERE embedding IS NOT NULL
-                 AND (triage_relevant IS NULL OR triage_reason = 'PARSE_FAILED')
+                 AND triage_reason = 'PARSE_FAILED'
+               ORDER BY heuristic_score DESC"""
+        ).fetchall()
+    elif resume:
+        rows = store.conn.execute(
+            """SELECT id, node_type, source, timestamp, subject, sender,
+                      recipients, body_preview, heuristic_score, tier, thread_id
+               FROM nodes
+               WHERE embedding IS NOT NULL
+                 AND triage_reason = 'PARSE_FAILED'
                ORDER BY heuristic_score DESC"""
         ).fetchall()
     else:
@@ -541,7 +634,7 @@ def run_triage(
         else:
             prompt = items_text[0] + "\n" + TRIAGE_BATCH_SUFFIX
 
-        max_tokens = 200 * len(batch_ids)
+        max_tokens = 1000 * len(batch_ids)
 
         MAX_RETRIES = 2
         results: dict[str, TriageResult | None] = {nid: None for nid in batch_ids}
@@ -562,7 +655,7 @@ def run_triage(
                     prompt = "\n".join(items_text) + "\n" + TRIAGE_BATCH_SUFFIX
                 else:
                     prompt = items_text[0] + "\n" + TRIAGE_BATCH_SUFFIX
-                max_tokens = 200 * len(pending_ids)
+                max_tokens = 500 * len(pending_ids)
                 logger.info("Retry %d: %d/%d items", attempt, len(pending_ids), len(batch_ids))
 
             raw_response = client.generate(
@@ -582,6 +675,7 @@ def run_triage(
         return results
 
     pending_writes = []
+    processed_count = 0
 
     with Progress(
         SpinnerColumn(),
@@ -646,7 +740,10 @@ def run_triage(
                     store.conn.commit()
                     pending_writes.clear()
 
-                progress.update(task, advance=len(batch_ids))
+                processed_count += len(batch_ids)
+                fail_pct = (failed_count / processed_count * 100) if processed_count else 0
+                progress.update(task, advance=len(batch_ids),
+                                description=f"Triaging... ✓{triaged} ✗{failed_count} ({fail_pct:.0f}% fail)")
 
     # Flush remaining writes
     for args in pending_writes:

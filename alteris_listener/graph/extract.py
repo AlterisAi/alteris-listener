@@ -1062,9 +1062,10 @@ def run_extraction(
     console.print(f"  Routing: {len(local_items)} local, {len(cloud_items)} cloud, "
                   f"{threads_skipped} skipped")
 
-    # ── Local (sequential) ──
-    if local_items:
-        console.print(f"\n  [bold]Local processing ({len(local_items)} threads):[/bold]")
+    # ── Run local and cloud in parallel ──
+    local_results = {"processed": 0, "commitments": 0, "errors": 0}
+
+    def _run_local():
         for thread_id, nodes in local_items:
             node_ids = [n["id"] for n in nodes]
             t0 = time.time()
@@ -1082,8 +1083,8 @@ def run_extraction(
                     status="success", commitments_found=len(commitments_raw),
                     processing_ms=elapsed_ms,
                 )
-                total_commitments += count
-                threads_processed += 1
+                local_results["commitments"] += count
+                local_results["processed"] += 1
 
                 if commitments_raw:
                     console.print(
@@ -1097,7 +1098,14 @@ def run_extraction(
                     prompt_version=PROMPT_VERSION, model_used="error",
                     status="error", error_msg=str(e),
                 )
-                errors += 1
+                local_results["errors"] += 1
+
+    import threading
+    local_thread = None
+    if local_items:
+        console.print(f"\n  [bold]Local processing ({len(local_items)} threads):[/bold]")
+        local_thread = threading.Thread(target=_run_local)
+        local_thread.start()
 
     # ── Cloud (async parallel) ──
     if cloud_items:
@@ -1113,6 +1121,13 @@ def run_extraction(
         errors += cloud_errors
         console.print(f"    Done: {cloud_processed} threads in {cloud_elapsed:.1f}s "
                       f"({cloud_commitments} commitments, {cloud_errors} errors)")
+
+    # Wait for local to finish
+    if local_thread:
+        local_thread.join()
+        threads_processed += local_results["processed"]
+        total_commitments += local_results["commitments"]
+        errors += local_results["errors"]
 
     # ── Standalone (async parallel for cloud, sequential for local) ──
     standalone = grouped["standalone"]

@@ -233,6 +233,7 @@ QUERY TYPES available:
 - recent_from_person: Get the N most recent communications with a person
 - commitments_search: Search open commitments by keyword
 - thread_lookup: Get full thread by thread_id
+- meeting_lookup: Get full meeting notes by node ID (use for items in the "Additional Past Meetings" manifest)
 
 RULES:
 1. Be surgical. Only request what would materially improve the briefing.
@@ -839,120 +840,164 @@ def _gather_meeting_context(
             (node_id, edge_type, min_weight, node_id, edge_type, min_weight),
         ).fetchall()
 
-    # ── Hop 1: Direct structural edges from the calendar event ──
+    # ── Relevance-scored BFS: walk graph, score by edge_weight / hop ──
+    import time as _time
+
+    now = _time.time()
     visited = {event_id}
-    hop1_contacts = []  # contact node IDs from attendee edges
-    hop1_content = []   # non-contact nodes (emails, meetings, messages)
+    hop1_contacts = []
+    node_scores: dict[str, float] = {}
+    node_meta: dict[str, dict] = {}
 
+    def _recency_boost(node):
+        """Boost score by time bucket: this week > last week > ... > older."""
+        ts = node.get("timestamp", 0) if node else 0
+        if not ts:
+            return 1.0
+        age_days = (now - ts) / 86400
+        if age_days <= 7:       # this week
+            return 3.0
+        elif age_days <= 14:    # last week
+            return 2.0
+        elif age_days <= 30:    # this month
+            return 1.5
+        elif age_days <= 90:    # last 3 months
+            return 1.2
+        elif age_days <= 365:   # last year
+            return 1.0
+        return 0.7              # older than a year
+
+    def _record(nid, node, hop, weight, via_edge, via_contact=None):
+        score = (weight / hop) * _recency_boost(node)
+        if nid in node_scores:
+            if score > node_scores[nid]:
+                node_scores[nid] = score
+                node_meta[nid] = {"hop": hop, "via_edge": via_edge,
+                                  "via_contact": via_contact, "node": node}
+        else:
+            node_scores[nid] = score
+            node_meta[nid] = {"hop": hop, "via_edge": via_edge,
+                              "via_contact": via_contact, "node": node}
+
+    # Hop 1: structural edges from calendar event
     HOP1_EDGE_TYPES = ["same_event", "same_thread", "attendee"]
-
     for etype in HOP1_EDGE_TYPES:
         for nbr_id, weight in _get_neighbors(event_id, etype):
             if nbr_id in visited:
                 continue
             visited.add(nbr_id)
-
             node = _load_node(nbr_id)
             if not node:
                 continue
-
             if node["node_type"] == "contact":
                 hop1_contacts.append(node)
             else:
-                node["_hop"] = 1
-                node["_via_edge"] = etype
-                hop1_content.append(node)
+                _record(nbr_id, node, 1, weight, etype)
 
-    # ── Hop 2a: From contact nodes, find their emails/messages/meetings ──
-    # Key multi-hop: calendar -> attendee -> contact -> sent_to -> email
-    hop2_content = []
-
+    # Hop 2a: from contacts, follow structural edges
     CONTACT_EDGE_TYPES = ["sent_to", "cc_to", "reply_to", "attendee"]
-
     for contact in hop1_contacts:
         cid = contact["id"]
+        contact_name = contact.get("_data", {}).get("display_name", cid)
         for etype in CONTACT_EDGE_TYPES:
             for nbr_id, weight in _get_neighbors(cid, etype):
-                if nbr_id in visited:
-                    continue
-                visited.add(nbr_id)
+                already_seen = nbr_id in visited
+                if not already_seen:
+                    visited.add(nbr_id)
+                    node = _load_node(nbr_id)
+                    if not node or node["node_type"] == "contact":
+                        continue
+                    _record(nbr_id, node, 2, weight, f"contact:{etype}", contact_name)
+                elif nbr_id in node_meta:
+                    _record(nbr_id, node_meta[nbr_id]["node"], 2,
+                            weight, f"contact:{etype}", contact_name)
 
-                node = _load_node(nbr_id)
-                if not node or node["node_type"] == "contact":
-                    continue  # don't chase contact -> contact
+    # Hop 2b + Hop 3: semantic edges from content nodes
+    SEMANTIC_EDGES = {"same_entity": 0.05, "same_topic": 0.05}
+    for hop_level in (1, 2):
+        source_ids = [nid for nid, m in node_meta.items() if m["hop"] == hop_level]
+        target_hop = hop_level + 1
+        for src_id in source_ids:
+            for etype, min_w in SEMANTIC_EDGES.items():
+                for nbr_id, weight in _get_neighbors(src_id, etype, min_w):
+                    already_seen = nbr_id in visited
+                    if not already_seen:
+                        visited.add(nbr_id)
+                        node = _load_node(nbr_id)
+                        if not node or node["node_type"] == "contact":
+                            continue
+                        _record(nbr_id, node, target_hop, weight, etype)
+                    elif nbr_id in node_meta:
+                        _record(nbr_id, node_meta[nbr_id]["node"], target_hop,
+                                weight, etype)
 
-                node["_hop"] = 2
-                node["_via_edge"] = f"contact:{etype}"
-                node["_via_contact"] = contact.get("_data", {}).get("display_name", cid)
-                hop2_content.append(node)
+    # ── Rank and split into full-content vs manifest ──
+    ranked = sorted(node_scores.items(), key=lambda x: x[1], reverse=True)
+    seven_days_ago = _time.time() - 7 * 86400
 
-    # ── Hop 2b: From hop-1 content nodes, follow strong semantic edges ──
-    HOP2_SEMANTIC = {
-        "same_entity": 0.30,   # only strong entity co-occurrence
-        "same_topic": 0.15,    # only strong topic matches
-    }
-
-    for h1_node in hop1_content:
-        nid = h1_node["id"]
-        for etype, min_weight in HOP2_SEMANTIC.items():
-            for nbr_id, weight in _get_neighbors(nid, etype, min_weight):
-                if nbr_id in visited:
-                    continue
-                visited.add(nbr_id)
-
-                node = _load_node(nbr_id)
-                if not node or node["node_type"] == "contact":
-                    continue
-
-                node["_hop"] = 2
-                node["_via_edge"] = etype
-                hop2_content.append(node)
-
-    # ── Categorize all gathered content nodes ──
-    all_content = hop1_content + hop2_content
     related_emails = []
     related_meetings = []
     related_messages = []
+    meeting_manifest = []
+    email_count = meeting_count = message_count = 0
 
-    for n in all_content:
+    for nid, score in ranked:
+        meta = node_meta[nid]
+        node = meta["node"]
+        if not node:
+            continue
+        node_type = node["node_type"]
+
         ts_str = ""
-        if n.get("timestamp"):
+        if node.get("timestamp"):
             try:
-                dt = datetime.fromtimestamp(n["timestamp"], tz=local_tz)
+                dt = datetime.fromtimestamp(node["timestamp"], tz=local_tz)
                 ts_str = dt.strftime("%Y-%m-%d %H:%M")
             except (OSError, ValueError):
                 pass
 
-        summary = {
-            "id": n["id"],
-            "subject": n.get("subject", "(no subject)"),
-            "sender": n.get("sender", ""),
+        is_recent = node.get("timestamp", 0) >= seven_days_ago
+
+        base = {
+            "id": nid,
+            "subject": node.get("subject", "(no subject)"),
+            "sender": node.get("sender", ""),
             "date": ts_str,
-            "body_preview": (n.get("body_preview") or "")[:400],
-            "hop": n.get("_hop", 0),
-            "via": n.get("_via_edge", ""),
+            "hop": meta["hop"],
+            "via": meta["via_edge"],
+            "relevance": round(score, 3),
         }
 
-        if n["node_type"] == "email":
-            related_emails.append(summary)
-        elif n["node_type"] == "meeting":
-            meeting_body = n.get("_data", {}).get("body", "") or n.get("body_preview", "")
-            summary["notes_preview"] = (meeting_body or "")[:600]
-            related_meetings.append(summary)
-        elif n["node_type"] == "message":
-            related_messages.append(summary)
-        elif n["node_type"] == "calendar" and n["id"] != event_id:
-            # Past calendar events with same people -> treat as meetings
-            related_meetings.append(summary)
+        if node_type == "email":
+            if email_count < max_emails:
+                base["body_preview"] = (node.get("body_preview") or "")[:400]
+                related_emails.append(base)
+                email_count += 1
 
-    # Sort by date descending (newest first)
+        elif node_type == "meeting":
+            meeting_body = node.get("_data", {}).get("body", "") or node.get("body_preview", "")
+            if is_recent or meeting_count < max_meetings:
+                base["body_preview"] = (node.get("body_preview") or "")[:400]
+                base["notes_preview"] = (meeting_body or "")[:1500]
+                related_meetings.append(base)
+                meeting_count += 1
+            else:
+                meeting_manifest.append(base)
+
+        elif node_type == "message":
+            if message_count < max_messages:
+                base["body_preview"] = (node.get("body_preview") or "")[:400]
+                related_messages.append(base)
+                message_count += 1
+
+        elif node_type == "calendar" and nid != event_id:
+            if is_recent or meeting_count < max_meetings:
+                related_meetings.append(base)
+                meeting_count += 1
+
+    # Sort each list by date descending
     for lst in (related_emails, related_meetings, related_messages):
         lst.sort(key=lambda x: x.get("date", ""), reverse=True)
-
-    # Cap
-    related_emails = related_emails[:max_emails]
-    related_meetings = related_meetings[:max_meetings]
-    related_messages = related_messages[:max_messages]
 
     # ── Find open commitments involving attendees ──
     attendee_names_full = [a["name"].lower() for a in event["_attendees"] if a.get("name")]
@@ -1020,6 +1065,8 @@ def _gather_meeting_context(
         parts.append(f"{len(related_emails)} related emails")
     if related_meetings:
         parts.append(f"{len(related_meetings)} past meetings")
+    if meeting_manifest:
+        parts.append(f"{len(meeting_manifest)} more available on request")
     if related_messages:
         parts.append(f"{len(related_messages)} message threads")
     if commitments:
@@ -1030,6 +1077,7 @@ def _gather_meeting_context(
         "related_emails": related_emails,
         "related_meetings": related_meetings,
         "related_messages": related_messages,
+        "meeting_manifest": meeting_manifest,
         "commitments": commitments,
         "contact_nodes": hop1_contacts,
         "context_summary": context_summary,
@@ -1415,6 +1463,46 @@ def _execute_graph_query(
                     "query_source": f"thread_lookup:{thread_id}",
                 })
 
+        elif qtype == "meeting_lookup":
+            # Load full meeting notes by node ID
+            meeting_id = params.get("id", "")
+            if not meeting_id:
+                return []
+            row = store.conn.execute(
+                """SELECT id, node_type, source, timestamp, subject, sender,
+                          body_preview, data
+                   FROM nodes
+                   WHERE id = ? AND node_type = 'meeting'""",
+                (meeting_id,),
+            ).fetchone()
+            if row:
+                node = dict(row)
+                ts_str = ""
+                if node.get("timestamp"):
+                    try:
+                        dt = datetime.fromtimestamp(node["timestamp"], tz=local_tz)
+                        ts_str = dt.strftime("%Y-%m-%d %H:%M")
+                    except (OSError, ValueError):
+                        pass
+                meeting_body = ""
+                if node.get("data"):
+                    try:
+                        mdata = msgpack.unpackb(node["data"], raw=False)
+                        meeting_body = mdata.get("body", "") or ""
+                    except Exception:
+                        pass
+                if not meeting_body:
+                    meeting_body = node.get("body_preview", "") or ""
+                results.append({
+                    "id": node["id"],
+                    "subject": node.get("subject", ""),
+                    "sender": node.get("sender", ""),
+                    "date": ts_str,
+                    "body_preview": (node.get("body_preview") or "")[:400],
+                    "notes_preview": meeting_body[:1500],
+                    "query_source": f"meeting_lookup:{meeting_id}",
+                })
+
     except Exception as e:
         logger.warning("Graph query failed (%s): %s", qtype, e)
 
@@ -1674,8 +1762,9 @@ def _format_meeting_context_for_llm(
         for e in context["related_emails"]:
             hop_tag = f" [hop-{e['hop']}]" if e.get("hop", 0) > 1 else ""
             stale_tag = " [STALE]" if e.get("_stale") else ""
-            parts.append(f"- [{e['date']}]{stale_tag} From: {e['sender']} | Subject: {e['subject']}{hop_tag}")
-            if e["body_preview"]:
+            rel_tag = f" [rel={e['relevance']}]" if e.get("relevance") else ""
+            parts.append(f"- [{e['date']}]{stale_tag}{rel_tag} From: {e['sender']} | Subject: {e['subject']}{hop_tag}")
+            if e.get("body_preview"):
                 parts.append(f"  Preview: {e['body_preview'][:250]}")
 
     # Past meetings
@@ -1683,7 +1772,8 @@ def _format_meeting_context_for_llm(
         parts.append("\n## Past Meetings / Calendar Events with These People")
         for m in context["related_meetings"]:
             stale_tag = " [STALE]" if m.get("_stale") else ""
-            parts.append(f"- [{m['date']}]{stale_tag} {m['subject']}")
+            rel_tag = f" [relevance={m['relevance']}]" if m.get("relevance") else ""
+            parts.append(f"- [{m['date']}]{stale_tag}{rel_tag} {m['subject']}")
             if m.get("notes_preview"):
                 parts.append(f"  Notes: {m['notes_preview'][:400]}")
 
@@ -1693,6 +1783,14 @@ def _format_meeting_context_for_llm(
         for msg in context["related_messages"]:
             stale_tag = " [STALE]" if msg.get("_stale") else ""
             parts.append(f"- [{msg['date']}]{stale_tag} {msg['sender']}: {msg['body_preview'][:200]}")
+
+    # Meeting manifest (older meetings available on request)
+    if context.get("meeting_manifest"):
+        parts.append("\n## Additional Past Meetings (available via meeting_lookup query)")
+        parts.append("Request any of these by ID if relevant to the briefing:")
+        for m in context["meeting_manifest"]:
+            rel_tag = f" [rel={m['relevance']}]" if m.get("relevance") else ""
+            parts.append(f"- [{m['date']}]{rel_tag} {m['subject']} (id: {m['id']})")
 
     # Open commitments
     if context["commitments"]:
@@ -2209,7 +2307,8 @@ def run_briefing(
 
             holiday_context = {
                 "related_emails": [], "related_meetings": [],
-                "related_messages": [], "commitments": [],
+                "related_messages": [], "meeting_manifest": [],
+                "commitments": [],
                 "contact_nodes": [], "context_summary": "holiday",
             }
 

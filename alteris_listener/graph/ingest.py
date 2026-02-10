@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -37,6 +38,7 @@ def _node_type_for_source(source: str) -> str:
         "slack": "message",
         "granola": "meeting",
         "calendar": "calendar_event",
+        "documents": "document",
     }.get(source, "document")
 
 
@@ -60,6 +62,7 @@ def ingest_message(
     msg: Message,
     thread_sizes: dict[str, int] | None = None,
     now: int | None = None,
+    contact_lookup: "ContactLookup | None" = None,
 ) -> Optional[str]:
     """Ingest a single message into the graph.
 
@@ -78,6 +81,18 @@ def ingest_message(
 
     # Extract entities
     entities = extract_entities_from_message(msg)
+
+    # Enrich empty display names from Contacts.app
+    if contact_lookup:
+        if entities.sender and not entities.sender.display_name:
+            name = contact_lookup.resolve_name(entities.sender.normalized_email)
+            if name:
+                entities.sender.display_name = name
+        for recip in entities.recipients:
+            if not recip.display_name:
+                name = contact_lookup.resolve_name(recip.normalized_email)
+                if name:
+                    recip.display_name = name
 
     # Parse CC recipients from metadata (mail reader provides these)
     meta = msg.metadata or {}
@@ -102,10 +117,21 @@ def ingest_message(
         "sender_raw": msg.sender,
         "recipient_raw": msg.recipient,
         "subject": msg.subject,
-        "body": msg.body[:5000] if msg.body else "",
+        "body": msg.body or "",  # full body stored in msgpacked data for triage chunking
+        "body_length": len(msg.body) if msg.body else 0,
         "is_from_me": msg.is_from_me,
         "thread_id": msg.thread_id,
     }
+    # Store source URI for retrieving full content on demand
+    meta = msg.metadata or {}
+    if "file_path" in meta:
+        data["source_uri"] = meta["file_path"]
+    elif "message_id" in meta:
+        data["source_uri"] = f"mail://{meta['message_id']}"
+    elif "meeting_id" in meta:
+        data["source_uri"] = f"granola://{meta['meeting_id']}"
+    elif msg.thread_id:
+        data["source_uri"] = f"{msg.source}://{msg.thread_id}"
     data.update(meta)
 
     # Look up sender contact stats for scoring
@@ -216,29 +242,29 @@ def ingest_message(
 
     # ── Update contact stats ─────────────────────────────────────
 
-    if entities.sender and not entities.sender.is_automated:
-        if entities.is_from_user:
-            # User sent this — update all recipients
-            for recip in entities.recipients:
-                if not recip.is_automated and not recip.is_user:
-                    store.upsert_contact(
-                        contact_id=recip.contact_id,
-                        display_name=recip.display_name,
-                        sent_to_delta=1,
-                        timestamp=ts,
-                        avg_body_length=len(msg.body) if msg.body else 0,
-                        source=msg.source,
-                    )
-        else:
-            # Someone sent to user
-            store.upsert_contact(
-                contact_id=entities.sender.contact_id,
-                display_name=entities.sender.display_name,
-                recv_from_delta=1,
-                timestamp=ts,
-                avg_body_length=len(msg.body) if msg.body else 0,
-                source=msg.source,
-            )
+    if entities.is_from_user:
+        # User sent this — update all recipients (sender may be None
+        # for iMessage/RCS where sender="me")
+        for recip in entities.recipients:
+            if not recip.is_automated and not recip.is_user:
+                store.upsert_contact(
+                    contact_id=recip.contact_id,
+                    display_name=recip.display_name,
+                    sent_to_delta=1,
+                    timestamp=ts,
+                    avg_body_length=len(msg.body) if msg.body else 0,
+                    source=msg.source,
+                )
+    elif entities.sender and not entities.sender.is_automated:
+        # Someone sent to user
+        store.upsert_contact(
+            contact_id=entities.sender.contact_id,
+            display_name=entities.sender.display_name,
+            recv_from_delta=1,
+            timestamp=ts,
+            avg_body_length=len(msg.body) if msg.body else 0,
+            source=msg.source,
+        )
 
     # ── Update activity signals ──────────────────────────────────
 
@@ -273,10 +299,23 @@ def ingest_messages(
                 name = contact_lookup.resolve_name(msg.sender)
                 if name:
                     msg.sender = f"{name} <{msg.sender}>"
-            if msg.recipient and msg.recipient.startswith("+"):
-                name = contact_lookup.resolve_name(msg.recipient)
-                if name:
-                    msg.recipient = f"{name} <{msg.recipient}>"
+            if msg.recipient and "+" in msg.recipient:
+                # Resolve each recipient individually to avoid
+                # clobbering multi-recipient strings like
+                # "+1234, +5678" → "Name <+1234, +5678>" (broken)
+                parts = re.split(r"[;,]", msg.recipient)
+                resolved = []
+                for part in parts:
+                    part = part.strip()
+                    if part.startswith("+"):
+                        name = contact_lookup.resolve_name(part)
+                        if name:
+                            resolved.append(f"{name} <{part}>")
+                        else:
+                            resolved.append(part)
+                    else:
+                        resolved.append(part)
+                msg.recipient = ", ".join(resolved)
 
     # Pre-compute thread sizes
     thread_sizes: dict[str, int] = {}
@@ -289,7 +328,8 @@ def ingest_messages(
     skipped = 0
 
     for msg in messages:
-        node_id = ingest_message(store, msg, thread_sizes=thread_sizes, now=now)
+        node_id = ingest_message(store, msg, thread_sizes=thread_sizes, now=now,
+                                contact_lookup=contact_lookup)
         if node_id:
             ingested += 1
         else:

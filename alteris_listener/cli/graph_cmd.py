@@ -268,8 +268,10 @@ def status():
         console.print()
         console.print("[bold]Triage (Pass 3):[/bold]")
         console.print(f"  Triaged:      {stats['triaged_total']}")
-        console.print(f"  Relevant:     {stats['triaged_relevant']}")
-        console.print(f"  Not relevant: {stats['triaged_not_relevant']}")
+        if "triaged_relevant" in stats:
+            console.print(f"  Relevant:     {stats['triaged_relevant']}")
+        if "triaged_not_relevant" in stats:
+            console.print(f"  Not relevant: {stats['triaged_not_relevant']}")
 
     store.close()
 
@@ -664,40 +666,113 @@ def show_node(node_id: str):
 
 @graph_cli.command("triage")
 @click.option("--model", default="qwen3:30b-a3b",
-              help="Ollama model for triage (default: qwen3:8b)")
+              help="Model for triage (default: qwen3:30b-a3b for Ollama, gemini-2.5-flash for Gemini)")
 @click.option("--parallel", default=3, type=int,
-              help="Number of concurrent Ollama requests (default: 3)")
+              help="Number of concurrent requests (default: 3)")
 @click.option("--batch-size", default=5, type=int,
               help="Max items per LLM call (default: 5)")
 @click.option("--no-resume", is_flag=True,
               help="Re-triage all embedded nodes, not just untriaged ones")
-def triage(model: str, parallel: int, batch_size: int, no_resume: bool):
-    """Run Pass 3: LLM triage on embedded nodes (requires Ollama).
+@click.option("--fix-failed", is_flag=True,
+              help="Retry only PARSE_FAILED nodes (e.g. with gemini after ollama failures)")
+@click.option("--provider", default="ollama", type=click.Choice(["ollama", "gemini"]),
+              help="LLM provider: ollama (local) or gemini (API, faster)")
+def triage(model: str, parallel: int, batch_size: int, no_resume: bool, fix_failed: bool, provider: str):
+    """Run Pass 3: LLM triage on embedded nodes.
 
-    Uses qwen3:8b to score embedded nodes on a 0-1 scale.
+    Uses LLM to score embedded nodes on a 0-1 scale.
     Batches thread-related items together for context and throughput.
     Scores route to processing tiers:
       <0.3 = ignore, 0.3-0.6 = lightweight (8B), 0.7+ = deep (30B)
 
     Resumable by default — re-run to continue after interruption.
-    Set OLLAMA_NUM_PARALLEL=3 before starting ollama serve for best speed.
 
-    \\b
+    \b
     Examples:
-        alteris-listener graph triage                     # Default
-        alteris-listener graph triage --batch-size 10     # Larger batches
-        alteris-listener graph triage --no-resume         # Re-triage everything
+        alteris-listener graph triage                         # Local Ollama
+        alteris-listener graph triage --provider gemini       # Fast via Gemini API
+        alteris-listener graph triage --provider gemini --parallel 10 --batch-size 10
+        alteris-listener graph triage --no-resume             # Re-triage everything
+        alteris-listener graph triage --fix-failed --provider gemini  # Fix parse failures
     """
     from alteris_listener.graph.triage import run_triage
     from alteris_listener.graph.store import GraphStore
 
     store = GraphStore()
     result = run_triage(store, model=model, parallel=parallel,
-                        resume=not no_resume, batch_size=batch_size)
+                        resume=not no_resume, batch_size=batch_size,
+                        provider=provider, fix_failed=fix_failed)
 
     if result.get("error") == "ollama_not_running":
         console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
+    if result.get("error") == "gemini_api_key_missing":
+        console.print("[red]GEMINI_API_KEY not set. Run: alteris-listener set-key gemini[/red]")
     store.close()
+
+
+@graph_cli.command("refresh")
+@click.option("--hours", default=48, type=int,
+              help="Lookback hours for new data (default: 48)")
+@click.option("--provider", default="ollama", type=click.Choice(["ollama", "gemini"]),
+              help="LLM provider for triage (default: ollama)")
+@click.option("--parallel", default=3, type=int,
+              help="Concurrent triage requests (default: 3, try 10 for gemini)")
+def refresh(hours: int, provider: str, parallel: int):
+    """Quick incremental refresh: pull new data + triage.
+
+    Chains bootstrap (incremental) → triage (new nodes only).
+    Much faster than a full bootstrap since it only reads recent data.
+
+    \b
+    Examples:
+        alteris-listener graph refresh                        # Last 48h, local Ollama
+        alteris-listener graph refresh --provider gemini      # Last 48h, fast Gemini
+        alteris-listener graph refresh --hours 168            # Last week
+    """
+    import time
+    from alteris_listener.graph.bootstrap import BootstrapPipeline
+    from alteris_listener.graph.triage import run_triage
+    from alteris_listener.graph.store import GraphStore
+
+    t0 = time.time()
+    store = GraphStore()
+
+    # Step 1: Incremental bootstrap
+    console.print(f"[bold]Step 1: Pull new data (last {hours}h)[/bold]\n")
+    pipeline = BootstrapPipeline(store)
+    stats = pipeline.run_structural_pass(hours=hours)
+
+    new_count = stats.get("ingested", 0)
+    if new_count == 0:
+        console.print("  [dim]No new items found. Graph is up to date.[/dim]")
+        store.close()
+        elapsed = time.time() - t0
+        console.print(f"\n[green]Refresh complete in {elapsed:.0f}s (nothing new)[/green]")
+        return
+
+    console.print(f"  [green]{new_count} new items ingested[/green]\n")
+
+    # Step 2: Embed new nodes (required before triage)
+    console.print("[bold]Step 2: Embed new nodes[/bold]\n")
+    embed_stats = pipeline.run_embedding_pass(min_score=0.05)
+    console.print()
+
+    # Step 3: Triage new nodes
+    console.print(f"[bold]Step 3: Triage new nodes (provider={provider})[/bold]\n")
+    triage_result = run_triage(
+        store, parallel=parallel, resume=True,
+        batch_size=10 if provider == "gemini" else 5,
+        provider=provider,
+    )
+
+    if triage_result.get("error") == "ollama_not_running":
+        console.print("[red]Ollama is not running. Start it with: ollama serve[/red]")
+    elif triage_result.get("error") == "gemini_api_key_missing":
+        console.print("[red]GEMINI_API_KEY not set. Run: alteris-listener set-key gemini[/red]")
+
+    store.close()
+    elapsed = time.time() - t0
+    console.print(f"\n[green]Refresh complete in {elapsed:.0f}s[/green]")
 
 
 @graph_cli.command("triage-bench")
@@ -939,6 +1014,195 @@ def dedup_contacts(dry_run: bool):
     store.close()
 
 
+@graph_cli.command("merge-contacts")
+@click.option("--dry-run", is_flag=True, help="Preview merges without applying")
+def merge_contacts(dry_run: bool):
+    """Merge phone-number contacts into their email contacts.
+
+    Uses macOS Contacts.app to find people who have both a phone and
+    an email. If both contact:+phone and contact:email exist in the
+    graph, merges the phone contact into the email one (sums stats,
+    re-points edges, removes phone contact row).
+
+    \\b
+    Examples:
+        alteris-listener graph merge-contacts --dry-run   # Preview
+        alteris-listener graph merge-contacts              # Apply
+    """
+    import json
+    from rich.table import Table
+    from alteris_listener.graph.contacts_resolver import ContactLookup
+    from alteris_listener.graph.store import GraphStore
+
+    store = GraphStore()
+    cl = ContactLookup()
+    cl.load()
+
+    bridges = cl.phone_email_bridges()
+    if not bridges:
+        console.print("  [dim]No phone→email bridges found in Contacts.app[/dim]")
+        store.close()
+        return
+
+    # Find mergeable pairs: phone contact AND email contact both exist
+    merge_plan = []
+    for phone_norm, emails in bridges.items():
+        phone_cid = f"contact:{phone_norm}"
+        phone_row = store.conn.execute(
+            """SELECT contact_id, display_name, total_messages, sent_to_count,
+                      recv_from_count, first_seen, last_seen, sources
+               FROM contact_stats WHERE contact_id = ?""",
+            (phone_cid,),
+        ).fetchone()
+        if not phone_row or phone_row["total_messages"] == 0:
+            continue
+
+        # Find first email that exists in graph
+        email_cid = None
+        for email in emails:
+            candidate = f"contact:{email}"
+            email_row = store.conn.execute(
+                "SELECT contact_id FROM contact_stats WHERE contact_id = ?",
+                (candidate,),
+            ).fetchone()
+            if email_row:
+                email_cid = candidate
+                break
+
+        if not email_cid:
+            continue
+
+        merge_plan.append({
+            "phone_cid": phone_cid,
+            "email_cid": email_cid,
+            "name": phone_row["display_name"] or cl.resolve_name(phone_norm) or phone_norm,
+            "phone_msgs": phone_row["total_messages"],
+            "phone_sent": phone_row["sent_to_count"],
+            "phone_recv": phone_row["recv_from_count"],
+        })
+
+    if not merge_plan:
+        console.print("  [dim]No phone→email merges found (no overlapping contacts)[/dim]")
+        store.close()
+        return
+
+    # Display plan
+    table = Table(title=f"{'DRY RUN — ' if dry_run else ''}Merge Plan ({len(merge_plan)} contacts)")
+    table.add_column("Name")
+    table.add_column("Phone Contact")
+    table.add_column("→ Email Contact")
+    table.add_column("Msgs")
+    table.add_column("Sent/Recv")
+
+    for m in sorted(merge_plan, key=lambda x: x["phone_msgs"], reverse=True):
+        table.add_row(
+            m["name"],
+            m["phone_cid"].replace("contact:", ""),
+            m["email_cid"].replace("contact:", ""),
+            str(m["phone_msgs"]),
+            f"{m['phone_sent']}/{m['phone_recv']}",
+        )
+    console.print(table)
+
+    if dry_run:
+        console.print("\n  [yellow]Dry run — no changes applied[/yellow]")
+        store.close()
+        return
+
+    # Execute merges
+    merged = 0
+    for m in merge_plan:
+        phone_cid = m["phone_cid"]
+        email_cid = m["email_cid"]
+
+        # 1. Sum contact stats into email contact
+        store.conn.execute(
+            """UPDATE contact_stats SET
+                 total_messages = total_messages + ?,
+                 sent_to_count = sent_to_count + ?,
+                 recv_from_count = recv_from_count + ?,
+                 first_seen = MIN(first_seen, ?),
+                 last_seen = MAX(last_seen, ?),
+                 display_name = COALESCE(NULLIF(display_name, ''), ?)
+               WHERE contact_id = ?""",
+            (
+                m["phone_msgs"], m["phone_sent"], m["phone_recv"],
+                store.conn.execute(
+                    "SELECT first_seen FROM contact_stats WHERE contact_id = ?",
+                    (phone_cid,),
+                ).fetchone()["first_seen"],
+                store.conn.execute(
+                    "SELECT last_seen FROM contact_stats WHERE contact_id = ?",
+                    (phone_cid,),
+                ).fetchone()["last_seen"],
+                m["name"],
+                email_cid,
+            ),
+        )
+
+        # 2. Recompute reply_ratio on merged contact
+        row = store.conn.execute(
+            "SELECT sent_to_count, recv_from_count, total_messages FROM contact_stats WHERE contact_id = ?",
+            (email_cid,),
+        ).fetchone()
+        if row and row["total_messages"] > 0:
+            rr = min(row["sent_to_count"], row["recv_from_count"]) / row["total_messages"]
+            store.conn.execute(
+                "UPDATE contact_stats SET reply_ratio = ? WHERE contact_id = ?",
+                (rr, email_cid),
+            )
+
+        # 3. Merge sources
+        phone_sources = store.conn.execute(
+            "SELECT sources FROM contact_stats WHERE contact_id = ?", (phone_cid,)
+        ).fetchone()
+        email_sources = store.conn.execute(
+            "SELECT sources FROM contact_stats WHERE contact_id = ?", (email_cid,)
+        ).fetchone()
+        if phone_sources and email_sources:
+            ps = set(json.loads(phone_sources["sources"]))
+            es = set(json.loads(email_sources["sources"]))
+            merged_sources = json.dumps(sorted(ps | es))
+            store.conn.execute(
+                "UPDATE contact_stats SET sources = ? WHERE contact_id = ?",
+                (merged_sources, email_cid),
+            )
+
+        # 4. Re-point edges from phone contact to email contact
+        store.conn.execute(
+            "UPDATE OR IGNORE edges SET src = ? WHERE src = ?",
+            (email_cid, phone_cid),
+        )
+        store.conn.execute(
+            "UPDATE OR IGNORE edges SET dst = ? WHERE dst = ?",
+            (email_cid, phone_cid),
+        )
+        # Clean up any duplicate edges that couldn't be updated
+        store.conn.execute("DELETE FROM edges WHERE src = ? OR dst = ?", (phone_cid, phone_cid))
+
+        # 5. Re-point nodes referencing this contact
+        store.conn.execute(
+            "UPDATE nodes SET sender = ? WHERE sender = ?",
+            (email_cid.replace("contact:", ""), phone_cid.replace("contact:", "")),
+        )
+
+        # 6. Delete phone contact stat
+        store.conn.execute("DELETE FROM contact_stats WHERE contact_id = ?", (phone_cid,))
+
+        # 7. Delete phone contact node if it exists
+        store.conn.execute("DELETE FROM nodes WHERE id = ?", (phone_cid,))
+
+        merged += 1
+
+    store.conn.commit()
+
+    # Recompute tiers
+    store.recompute_contact_tiers()
+    store.close()
+
+    console.print(f"\n  [green]Merged {merged} phone contacts into email contacts[/green]")
+
+
 @graph_cli.command("reset")
 @click.confirmation_option(prompt="This will delete the entire graph. Are you sure?")
 def reset():
@@ -950,6 +1214,51 @@ def reset():
         console.print(f"[green]✓[/green] Deleted {GRAPH_DB_PATH}")
     else:
         console.print("[dim]No graph database found[/dim]")
+
+
+@graph_cli.command("backfill-names")
+def backfill_names():
+    """Fill in missing display names on contacts from Contacts.app.
+
+    Looks up each contact's email or phone in macOS Contacts.app
+    and updates the display_name if it's currently empty.
+
+    \\b
+    Examples:
+        alteris-listener graph backfill-names
+    """
+    from alteris_listener.graph.contacts_resolver import ContactLookup
+    from alteris_listener.graph.store import GraphStore
+
+    store = GraphStore()
+    cl = ContactLookup()
+    cl.load()
+
+    # Find contacts with empty display names
+    rows = store.conn.execute(
+        "SELECT contact_id, display_name FROM contact_stats WHERE display_name IS NULL OR display_name = ''"
+    ).fetchall()
+
+    if not rows:
+        console.print("  [dim]All contacts already have display names[/dim]")
+        store.close()
+        return
+
+    updated = 0
+    for row in rows:
+        cid = row["contact_id"]
+        identifier = cid.replace("contact:", "")
+        name = cl.resolve_name(identifier)
+        if name:
+            store.conn.execute(
+                "UPDATE contact_stats SET display_name = ? WHERE contact_id = ?",
+                (name, cid),
+            )
+            updated += 1
+
+    store.conn.commit()
+    store.close()
+    console.print(f"  [green]Updated {updated}/{len(rows)} contacts with display names[/green]")
 
 
 @graph_cli.command("extract")
@@ -1161,8 +1470,60 @@ def brief_cmd(days, web_search, interactive, model, thinking, save_path):
     if save_path:
         from pathlib import Path
         path = Path(save_path).expanduser()
-        path.write_text(result["briefing"])
-        console.print(f"[green]✓[/green] Saved to {path}")
+        if path.suffix.lower() == ".pdf":
+            from alteris_listener.graph.briefing_pdf import render_briefing_pdf
+            render_briefing_pdf(
+                result["briefing"],
+                path,
+                title=f"Meeting Briefing — next {days} days",
+            )
+            console.print(f"[green]✓[/green] Saved PDF to {path}")
+        else:
+            path.write_text(result["briefing"])
+            console.print(f"[green]✓[/green] Saved to {path}")
 
     store.close()
     derived.close()
+
+
+@graph_cli.command("voice")
+@click.option("--days", default=7, type=int, help="Days ahead to brief on")
+@click.option("--thinking", default="medium", help="Thinking level: off|minimal|low|medium|high")
+@click.option("--model", default=None, help="Override voice model")
+@click.option("--no-tools", is_flag=True, default=False, help="Disable tools for testing voice-only")
+@click.option("--vertex", is_flag=True, default=False, help="Use Vertex AI (GA model, function calling supported)")
+@click.option("--project", default="ordinal-virtue-462602-p5", help="GCP project ID for Vertex AI")
+@click.option("--location", default="us-central1", help="GCP region for Vertex AI")
+def voice_cmd(days, thinking, model, no_tools, vertex, project, location):
+    """Start a real-time voice briefing session.
+
+    \b
+    Opens a live conversation with Alteris using Gemini's voice API.
+    Speak naturally — the agent will walk you through your week,
+    pull context from your knowledge graph, ask questions, and
+    generate a written briefing at the end.
+
+    \b
+    Requires: pip install pyaudio google-genai
+    Developer API: GEMINI_API_KEY set in Keychain or environment
+    Vertex AI:     gcloud auth application-default login
+
+    \b
+    Examples:
+        alteris-listener graph voice                  # Developer API
+        alteris-listener graph voice --vertex         # Vertex AI (production)
+        alteris-listener graph voice --no-tools       # test voice only
+        alteris-listener graph voice --model gemini-live-2.5-flash-preview
+    """
+    try:
+        import pyaudio  # noqa: F401
+    except ImportError:
+        console.print("[red]Error:[/red] pyaudio not installed.")
+        console.print("  Install with: pip install pyaudio")
+        console.print("  On macOS you may need: brew install portaudio")
+        return
+
+    from alteris_listener.graph.voice_agent import run_voice_session
+    run_voice_session(days=days, thinking=thinking, model=model,
+                      no_tools=no_tools, vertex=vertex,
+                      project=project, location=location)
